@@ -395,20 +395,29 @@ async def set_keys(keys_text: str = Form(...)):
     raw_lines = [k.strip() for k in keys_text.strip().splitlines() if k.strip()]
     new_keys = []
     for line in raw_lines:
+        key = None
+        # Handle full Helius URL with api-key param (even without protocol)
         if "api-key=" in line:
-            # User pasted full URL like mainnet.helius-rpc.com/?api-key=xxx
             try:
-                key = line.split("api-key=")[1].split("&")[0].strip()
-                if key:
-                    new_keys.append(key)
+                after = line.split("api-key=")[1]
+                key = after.split("&")[0].split(" ")[0].strip()
             except:
                 pass
-        elif line.startswith("http"):
-            # full URL without api-key param? skip or extract if possible
-            continue
+        elif line.startswith("http") or "helius-rpc.com" in line.lower():
+            # full URL, try to extract anyway
+            if "api-key=" in line:
+                try:
+                    after = line.split("api-key=")[1]
+                    key = after.split("&")[0].strip()
+                except:
+                    pass
         else:
-            # assume it's a clean key
-            new_keys.append(line)
+            # plain key
+            key = line.strip()
+
+        if key and len(key) > 10:  # basic sanity check for Helius key format
+            new_keys.append(key)
+
     # dedupe while preserving order
     seen = set()
     new_keys = [k for k in new_keys if not (k in seen or seen.add(k))]
