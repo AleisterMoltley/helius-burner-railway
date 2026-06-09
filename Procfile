@@ -1,1 +1,1 @@
-worker: python helius_quota_stress.py
+web: uvicorn app:app --host 0.0.0.0 --port $PORT
