@@ -38,6 +38,8 @@ import time
 from collections import defaultdict
 from typing import List
 
+from aiohttp import web  # for Railway health check endpoint
+
 HELIUS_RPC = "https://mainnet.helius-rpc.com"
 
 KNOWN_PROGRAMS = [
@@ -159,6 +161,25 @@ def build_weighted_pool(mode: str):
         weighted.extend([func] * weight)
     return weighted
 
+
+async def start_health_server():
+    """Minimal HTTP server so Railway sees the service as healthy (binds to $PORT)."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+
+    async def health(_request):
+        return web.Response(text="OK - Helius Burner running")
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/_health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[RAILWAY] Health check server listening on 0.0.0.0:{port}", flush=True)
+
 async def worker(worker_id, session, key, weighted_ops, stats, stop_event):
     while not stop_event.is_set():
         op = random.choice(weighted_ops)
@@ -238,6 +259,12 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=30)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        # Start minimal health check server if we're on Railway (or PORT is set)
+        # This prevents Railway from thinking the service is unhealthy / crashed
+        if os.getenv("PORT") or os.getenv("RAILWAY_ENVIRONMENT"):
+            asyncio.create_task(start_health_server())
+            await asyncio.sleep(0.5)  # give it a moment to bind
+
         tasks = []
         start_time = time.time()
 
