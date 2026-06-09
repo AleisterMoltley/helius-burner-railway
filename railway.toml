@@ -1,0 +1,10 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+sleepApplication = false
+
+# Optional: du kannst auch Nixpacks verwenden (dann brauchst du kein Dockerfile)
+# [build]
+# builder = "NIXPACKS"

@@ -1,0 +1,1 @@
+worker: python helius_quota_stress.py
