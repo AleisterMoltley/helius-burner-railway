@@ -392,7 +392,26 @@ async def get_stats():
 
 @app.post("/api/keys")
 async def set_keys(keys_text: str = Form(...)):
-    new_keys = [k.strip() for k in keys_text.strip().splitlines() if k.strip()]
+    raw_lines = [k.strip() for k in keys_text.strip().splitlines() if k.strip()]
+    new_keys = []
+    for line in raw_lines:
+        if "api-key=" in line:
+            # User pasted full URL like mainnet.helius-rpc.com/?api-key=xxx
+            try:
+                key = line.split("api-key=")[1].split("&")[0].strip()
+                if key:
+                    new_keys.append(key)
+            except:
+                pass
+        elif line.startswith("http"):
+            # full URL without api-key param? skip or extract if possible
+            continue
+        else:
+            # assume it's a clean key
+            new_keys.append(line)
+    # dedupe while preserving order
+    seen = set()
+    new_keys = [k for k in new_keys if not (k in seen or seen.add(k))]
     state["keys"] = new_keys
     state["recent_logs"].append(f"Updated keys ({len(new_keys)} total)")
     return {"ok": True, "count": len(new_keys)}
@@ -474,7 +493,7 @@ DASHBOARD_HTML = """
                     <label class="block text-xs font-medium text-zinc-400 mb-1.5">HELIUS KEYS (one per line)</label>
                     <textarea id="keys-text" rows="4" 
                               class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm font-mono resize-y"
-                              placeholder="key1&#10;key2&#10;key3"></textarea>
+                              placeholder="Paste full URL or just the key&#10;mainnet.helius-rpc.com/?api-key=xxx&#10;or just xxx"></textarea>
                     <button onclick="saveKeys()" 
                             class="mt-2 text-xs px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-2xl transition">
                         Save Keys
