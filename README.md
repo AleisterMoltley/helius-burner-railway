@@ -44,14 +44,17 @@ Then open http://localhost:8080
 ## How to use the Dashboard
 
 1. Paste your keys (one per line) in the textarea → **Save Keys**
-2. Set **Concurrency** (higher = faster burn, 150-300 is good)
+2. Set **Concurrency** (higher = faster burn, 150-300 is good, Nuke goes to 400+)
 3. Choose **Mode**:
-   - `expensive` → maximum pain (recommended)
-   - `mixed` → balanced aggression
-4. Click the big red **START BURN**
+   - **☢️ NUKE** → absolute maximum pointless destruction (recommended for "as fast to zero as possible")
+   - `expensive` → very heavy
+   - `mixed` → balanced
+4. Click the big red **START BURN** or the nuclear **NUKE MODE** button (sets 400 workers + nuke + starts instantly)
 5. Watch the live stats. The log shows recent activity and 429s.
 
 You can change config while it's running (it will use new values on next start).
+
+**Nuke Mode** is the fastest way to drain the key: highest weight on getProgramAccounts (no filters = huge responses), multiple calls per worker loop, zero sleeps, max concurrency. Goal: deplete quota as quickly as possible.
 
 ---
 

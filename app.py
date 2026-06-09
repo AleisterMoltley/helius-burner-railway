@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Helius Quota Burner Dashboard
-=============================
+Helius Quota Burner Dashboard - NUKE EDITION
+============================================
 
 Web UI to control and monitor pointless high-volume Helius RPC consumption.
+
+**Nuke Mode**: The fastest way to drive a key to zero.
+Prioritizes the heaviest possible calls (getProgramAccounts with no filters = massive data transfer),
+fires multiple calls per worker iteration with zero sleeps, and supports extreme concurrency (400+).
 
 WARNING:
 - This tool is designed to burn Helius API quota as fast as possible with
@@ -101,6 +105,16 @@ OPERATION_POOLS = {
         ("search_assets", 6),
         ("get_asset", 2),
         ("get_signatures_for_address", 3),
+    ],
+    "nuke": [
+        # MAXIMUM DESTRUCTION MODE - prioritize the heaviest calls possible
+        ("get_program_accounts", 12),      # king of quota burners (no filters = massive responses)
+        ("get_assets_by_owner", 8),
+        ("search_assets", 9),              # broad searches = expensive
+        ("get_signatures_for_address", 5),
+        ("get_recent_block", 4),
+        ("get_asset", 2),
+        ("get_slot", 1),
     ],
 }
 
@@ -204,33 +218,39 @@ def build_weighted_pool(mode: str) -> List[str]:
         weighted.extend([op_name] * weight)
     return weighted
 
-async def worker(worker_id: int, session: aiohttp.ClientSession, keys: List[str], weighted_ops: List[str], stop_event: asyncio.Event):
+async def worker(worker_id: int, session: aiohttp.ClientSession, keys: List[str], weighted_ops: List[str], stop_event: asyncio.Event, is_nuke: bool = False):
     key_index = 0
     while not stop_event.is_set() and keys:
-        op_name = random.choice(weighted_ops)
-        key = keys[key_index % len(keys)]
-        key_index += 1
+        # In nuke mode: fire multiple heavy calls per iteration with no delay
+        calls_this_loop = 3 if is_nuke else 1
 
-        try:
-            func = OP_MAP[op_name]
-            status = await func(session, key)
+        for _ in range(calls_this_loop):
+            if stop_event.is_set():
+                break
+            op_name = random.choice(weighted_ops)
+            key = keys[key_index % len(keys)]
+            key_index += 1
 
-            state["stats"]["total"] += 1
-            if status == 200:
-                state["stats"]["success"] += 1
-            elif status == 429:
-                state["stats"]["rate_limited"] += 1
-                state["recent_logs"].append(f"[{time.strftime('%H:%M:%S')}] 429 on {op_name}")
-            else:
-                state["stats"]["errors"] += 1
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            state["stats"]["exceptions"] += 1
+            try:
+                func = OP_MAP[op_name]
+                status = await func(session, key)
 
-        # tiny random sleep to not completely melt the event loop
-        if random.random() < 0.1:
-            await asyncio.sleep(0.001)
+                state["stats"]["total"] += 1
+                if status == 200:
+                    state["stats"]["success"] += 1
+                elif status == 429:
+                    state["stats"]["rate_limited"] += 1
+                    state["recent_logs"].append(f"[{time.strftime('%H:%M:%S')}] 429 on {op_name}")
+                else:
+                    state["stats"]["errors"] += 1
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                state["stats"]["exceptions"] += 1
+
+        # Only tiny sleep in non-nuke modes
+        if not is_nuke and random.random() < 0.05:
+            await asyncio.sleep(0.0005)
 
 async def stats_reporter(stop_event: asyncio.Event, start_time: float):
     last_total = 0
@@ -268,11 +288,12 @@ async def start_burner():
 
     weighted = build_weighted_pool(state["mode"])
     concurrency = max(1, int(state["concurrency"]))
+    is_nuke = state["mode"] == "nuke"
 
     tasks = []
     for i in range(concurrency):
         t = asyncio.create_task(
-            worker(i, session, state["keys"], weighted, state["stop_event"])
+            worker(i, session, state["keys"], weighted, state["stop_event"], is_nuke=is_nuke)
         )
         tasks.append(t)
 
@@ -472,6 +493,7 @@ DASHBOARD_HTML = """
                     <div>
                         <label class="block text-xs font-medium text-zinc-400 mb-1.5">MODE</label>
                         <select id="mode" class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm">
+                            <option value="nuke">☢️ NUKE (MAX DESTRUCTION)</option>
                             <option value="expensive">EXPENSIVE (max pain)</option>
                             <option value="mixed">MIXED</option>
                             <option value="das-heavy">DAS-HEAVY</option>
@@ -496,6 +518,14 @@ DASHBOARD_HTML = """
                         STOP
                     </button>
                 </div>
+
+                <!-- Nuke Button - instant max destruction -->
+                <button onclick="nukeMode()" 
+                        class="mt-3 w-full py-5 text-xl font-bold bg-gradient-to-r from-red-700 via-red-600 to-orange-600 hover:from-red-600 hover:to-red-500 active:scale-[0.985] rounded-3xl transition flex items-center justify-center gap-3 shadow-xl shadow-red-950">
+                    <span class="text-2xl">☢️</span>
+                    <span>NUKE MODE - MAX SPEED TO ZERO</span>
+                </button>
+                <p class="text-[10px] text-center text-red-500/70 mt-1">Sets 400 workers + nuke mode + starts immediately</p>
             </div>
 
             <!-- Live Stats -->
@@ -639,6 +669,25 @@ DASHBOARD_HTML = """
         async function stopBurn() {
             await fetch('/api/stop', { method: 'POST' });
             setTimeout(refreshStats, 300);
+        }
+
+        async function nukeMode() {
+            // Instant nuke: max aggression
+            document.getElementById('concurrency').value = 400;
+            document.getElementById('concurrency-slider').value = 400;
+            document.getElementById('mode').value = 'nuke';
+
+            // Apply config
+            const form = new FormData();
+            form.append('concurrency', 400);
+            form.append('mode', 'nuke');
+            await fetch('/api/config', { method: 'POST', body: form });
+
+            // Start immediately
+            const res = await fetch('/api/start', { method: 'POST' });
+            const data = await res.json();
+            if (!data.ok) alert(data.message || 'Failed to nuke');
+            setTimeout(refreshStats, 400);
         }
 
         // Load initial values
