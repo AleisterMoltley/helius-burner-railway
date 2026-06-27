@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
 """
-Helius Quota Burner Dashboard - NUKE EDITION
-============================================
+Helius Quota Burner Dashboard - OBLITERATE EDITION
+==================================================
 
-Web UI to control and monitor pointless high-volume Helius RPC consumption.
+Maximum credit destruction via 100-credit Wallet API, Enhanced Transactions,
+and getTransactionsForAddress endpoints.
 
-**Nuke Mode**: The fastest way to drive a key to zero.
-Prioritizes the heaviest possible calls (getProgramAccounts with no filters = massive data transfer),
-fires multiple calls per worker iteration with zero sleeps, and supports extreme concurrency (400+).
-
-WARNING:
-- This tool is designed to burn Helius API quota as fast as possible with
-  completely useless but expensive calls (getProgramAccounts, searchAssets,
-  getAssetsByOwner, getBlock full, etc.).
-- ONLY use API keys that YOU own or have explicit permission to abuse.
-- Using this on leaked or third-party keys can be illegal and against Helius ToS.
-- You are fully responsible.
-
-Optimized for Railway deployment as a web service.
+ONLY use API keys you own or have explicit permission to load-test.
 """
 
 import asyncio
@@ -25,20 +14,20 @@ import aiohttp
 import os
 import random
 import time
-from collections import defaultdict, deque
-from typing import List, Dict, Any
+from collections import deque
+from typing import List, Dict, Any, Callable, Awaitable, Tuple
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 # ==================== CONFIG & STATE ====================
 
 HELIUS_RPC = "https://mainnet.helius-rpc.com"
+HELIUS_API = "https://api.helius.xyz"
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2000"))
 
-# Same heavy, pointless operations as before (max quota burn)
 KNOWN_PROGRAMS = [
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
@@ -48,9 +37,19 @@ KNOWN_PROGRAMS = [
     "M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K",
 ]
 
-KNOWN_WALLETS = [
-    "11111111111111111111111111111111",
+# High-activity wallets — better responses for history/GTF/wallet API
+ACTIVE_WALLETS = [
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+    "86xCnPeV69n6t3DnyGvkKobf9FdN2H9oiVDdaMpo2MMY",
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
     "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+]
+
+KNOWN_WALLETS = ACTIVE_WALLETS + [
+    "11111111111111111111111111111111",
 ]
 
 KNOWN_MINTS = [
@@ -59,11 +58,19 @@ KNOWN_MINTS = [
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 ]
 
-# Global state (in-memory, fine for Railway lifetime)
+# Fallback signatures for enhanced transaction parsing
+FALLBACK_SIGNATURES = [
+    "4jzQxVTaJ4Fe4Fct9y1aaT9hmVyEjpCqE2bL8JMnuLZbzHZwaL4kZZvNEZ6bEj6fGmiAdCPjmNQHCf8v994PAgDf",
+    "5VERv8NMvzbJMEkVzxMoZrdUm9QRTebh5UKdkdvELVLZWr5jpFfGjkAPQouRXXjws3XkmZvwU2YBSaNxa6KJA3",
+    "2nBhEBYYvfaAe16UMNqRHre4YNSskvuYgx3M6E4JP1oDYvZEJHvoPzyUidNgX5e8ERochnyq1wYWpa5f9KUF9",
+]
+
+sig_pool: deque = deque(maxlen=10000)
+
 state: Dict[str, Any] = {
-    "keys": [],                    # list of api keys
+    "keys": [],
     "concurrency": 150,
-    "mode": "expensive",           # basic | das-heavy | expensive | mixed
+    "mode": "expensive",
     "running": False,
     "start_time": 0.0,
     "stats": {
@@ -73,15 +80,17 @@ state: Dict[str, Any] = {
         "errors": 0,
         "exceptions": 0,
         "current_rps": 0.0,
+        "credits_burned": 0,
+        "credit_rps": 0.0,
     },
-    "recent_logs": deque(maxlen=50),  # simple log buffer
+    "recent_logs": deque(maxlen=80),
     "stop_event": None,
     "tasks": [],
     "session": None,
     "reporter_task": None,
+    "harvester_task": None,
 }
 
-# Operation weights for "pointless burn"
 OPERATION_POOLS = {
     "basic": [
         ("get_slot", 3),
@@ -93,7 +102,7 @@ OPERATION_POOLS = {
         ("search_assets", 6),
     ],
     "expensive": [
-        ("get_program_accounts", 7),   # very quota hungry without filters
+        ("get_program_accounts", 7),
         ("get_signatures_for_address", 3),
         ("get_recent_block", 2),
     ],
@@ -107,101 +116,254 @@ OPERATION_POOLS = {
         ("get_signatures_for_address", 3),
     ],
     "nuke": [
-        # MAXIMUM DESTRUCTION MODE - prioritize the heaviest calls possible
-        ("get_program_accounts", 12),      # king of quota burners (no filters = massive responses)
+        ("get_program_accounts", 12),
         ("get_assets_by_owner", 8),
-        ("search_assets", 9),              # broad searches = expensive
+        ("search_assets", 9),
         ("get_signatures_for_address", 5),
         ("get_recent_block", 4),
         ("get_asset", 2),
         ("get_slot", 1),
     ],
+    "obliterate": [
+        # 100-credit endpoints — maximum destruction
+        ("enhanced_transactions", 18),
+        ("wallet_balances", 14),
+        ("wallet_history", 14),
+        ("wallet_transfers", 12),
+        ("wallet_batch_identity", 10),
+        ("wallet_identity", 8),
+        ("get_transactions_for_address", 16),
+        ("get_program_accounts", 4),
+        ("search_assets", 2),
+        ("get_assets_by_owner", 2),
+    ],
 }
 
-# ==================== BURNER LOGIC (same aggressive calls) ====================
+# Helius credit cost per successful call
+CREDIT_COSTS: Dict[str, int] = {
+    "get_slot": 1,
+    "get_recent_block": 2,
+    "get_program_accounts": 10,
+    "get_assets_by_owner": 10,
+    "search_assets": 10,
+    "get_asset": 10,
+    "get_signatures_for_address": 1,
+    "wallet_balances": 100,
+    "wallet_history": 100,
+    "wallet_transfers": 100,
+    "wallet_identity": 100,
+    "wallet_batch_identity": 100,
+    "enhanced_transactions": 100,
+    "get_transactions_for_address": 100,
+}
 
-async def do_get_slot(session: aiohttp.ClientSession, key: str) -> int:
+AGGRESSIVE_MODES = frozenset({"nuke", "obliterate"})
+
+# ==================== BURN OPERATIONS ====================
+
+BurnResult = Tuple[int, str]  # (http_status, op_name)
+
+
+async def do_get_slot(session: aiohttp.ClientSession, key: str) -> BurnResult:
     payload = {"jsonrpc": "2.0", "id": random.randint(1, 10**9), "method": "getSlot"}
     url = f"{HELIUS_RPC}/?api-key={key}"
     async with session.post(url, json=payload) as resp:
-        return resp.status
+        return resp.status, "get_slot"
 
-async def do_get_recent_block(session: aiohttp.ClientSession, key: str) -> int:
-    slot_payload = {"jsonrpc": "2.0", "id": 1, "method": "getSlot"}
+
+async def do_get_recent_block(session: aiohttp.ClientSession, key: str) -> BurnResult:
     url = f"{HELIUS_RPC}/?api-key={key}"
+    slot_payload = {"jsonrpc": "2.0", "id": 1, "method": "getSlot"}
     async with session.post(url, json=slot_payload) as r:
         data = await r.json()
         slot = data.get("result", 0)
 
     block_payload = {
-        "jsonrpc": "2.0", "id": random.randint(1, 10**9),
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
         "method": "getBlock",
-        "params": [slot - random.randint(1, 50), {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+        "params": [max(0, slot - random.randint(1, 50)), {
+            "encoding": "json",
+            "maxSupportedTransactionVersion": 0,
+            "transactionDetails": "full",
+            "rewards": True,
+        }],
     }
     async with session.post(url, json=block_payload) as resp:
-        return resp.status
+        return resp.status, "get_recent_block"
 
-async def do_get_program_accounts(session: aiohttp.ClientSession, key: str) -> int:
+
+async def do_get_program_accounts(session: aiohttp.ClientSession, key: str) -> BurnResult:
     program = random.choice(KNOWN_PROGRAMS)
     payload = {
-        "jsonrpc": "2.0", "id": random.randint(1, 10**9),
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
         "method": "getProgramAccounts",
-        "params": [program, {"encoding": "base64", "commitment": "confirmed"}]
+        "params": [program, {"encoding": "base64", "commitment": "confirmed"}],
     }
     url = f"{HELIUS_RPC}/?api-key={key}"
     async with session.post(url, json=payload) as resp:
-        return resp.status
+        return resp.status, "get_program_accounts"
 
-async def do_get_assets_by_owner(session: aiohttp.ClientSession, key: str) -> int:
+
+async def do_get_assets_by_owner(session: aiohttp.ClientSession, key: str) -> BurnResult:
     owner = random.choice(KNOWN_WALLETS + KNOWN_PROGRAMS)
     payload = {
-        "jsonrpc": "2.0", "id": random.randint(1, 10**9),
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
         "method": "getAssetsByOwner",
-        "params": {"ownerAddress": owner, "page": random.randint(1, 3), "limit": random.randint(50, 200)}
+        "params": {
+            "ownerAddress": owner,
+            "page": random.randint(1, 3),
+            "limit": random.randint(100, 1000),
+        },
     }
     url = f"{HELIUS_RPC}/?api-key={key}"
     async with session.post(url, json=payload) as resp:
-        return resp.status
+        return resp.status, "get_assets_by_owner"
 
-async def do_search_assets(session: aiohttp.ClientSession, key: str) -> int:
+
+async def do_search_assets(session: aiohttp.ClientSession, key: str) -> BurnResult:
     payload = {
-        "jsonrpc": "2.0", "id": random.randint(1, 10**9),
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
         "method": "searchAssets",
         "params": {
             "page": 1,
-            "limit": random.randint(50, 100),
+            "limit": random.randint(100, 1000),
             "options": {"showCollectionMetadata": True},
             **random.choice([
                 {"interface": "FungibleToken"},
                 {"interface": "V1_NFT"},
                 {"creatorAddress": random.choice(KNOWN_PROGRAMS)},
-                {}
-            ])
-        }
+                {},
+            ]),
+        },
     }
     url = f"{HELIUS_RPC}/?api-key={key}"
     async with session.post(url, json=payload) as resp:
-        return resp.status
+        return resp.status, "search_assets"
 
-async def do_get_asset(session: aiohttp.ClientSession, key: str) -> int:
+
+async def do_get_asset(session: aiohttp.ClientSession, key: str) -> BurnResult:
     mint = random.choice(KNOWN_MINTS)
-    payload = {"jsonrpc": "2.0", "id": random.randint(1, 10**9), "method": "getAsset", "params": {"id": mint}}
-    url = f"{HELIUS_RPC}/?api-key={key}"
-    async with session.post(url, json=payload) as resp:
-        return resp.status
-
-async def do_get_signatures_for_address(session: aiohttp.ClientSession, key: str) -> int:
-    addr = random.choice(KNOWN_WALLETS + KNOWN_PROGRAMS)
     payload = {
-        "jsonrpc": "2.0", "id": random.randint(1, 10**9),
-        "method": "getSignaturesForAddress",
-        "params": [addr, {"limit": 1000}]
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
+        "method": "getAsset",
+        "params": {"id": mint},
     }
     url = f"{HELIUS_RPC}/?api-key={key}"
     async with session.post(url, json=payload) as resp:
-        return resp.status
+        return resp.status, "get_asset"
 
-OP_MAP = {
+
+async def do_get_signatures_for_address(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    addr = random.choice(ACTIVE_WALLETS)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
+        "method": "getSignaturesForAddress",
+        "params": [addr, {"limit": 1000}],
+    }
+    url = f"{HELIUS_RPC}/?api-key={key}"
+    async with session.post(url, json=payload) as resp:
+        if resp.status == 200:
+            try:
+                data = await resp.json()
+                for entry in data.get("result") or []:
+                    sig = entry.get("signature")
+                    if sig:
+                        sig_pool.append(sig)
+            except Exception:
+                pass
+        return resp.status, "get_signatures_for_address"
+
+
+async def do_wallet_balances(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    wallet = random.choice(ACTIVE_WALLETS)
+    url = f"{HELIUS_API}/v1/wallet/{wallet}/balances?api-key={key}"
+    async with session.get(url) as resp:
+        return resp.status, "wallet_balances"
+
+
+async def do_wallet_history(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    wallet = random.choice(ACTIVE_WALLETS)
+    url = f"{HELIUS_API}/v1/wallet/{wallet}/history?api-key={key}&limit=100"
+    async with session.get(url) as resp:
+        return resp.status, "wallet_history"
+
+
+async def do_wallet_transfers(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    wallet = random.choice(ACTIVE_WALLETS)
+    url = f"{HELIUS_API}/v1/wallet/{wallet}/transfers?api-key={key}&limit=100"
+    async with session.get(url) as resp:
+        return resp.status, "wallet_transfers"
+
+
+async def do_wallet_identity(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    wallet = random.choice(ACTIVE_WALLETS)
+    url = f"{HELIUS_API}/v1/wallet/{wallet}/identity?api-key={key}"
+    async with session.get(url) as resp:
+        return resp.status, "wallet_identity"
+
+
+async def do_wallet_batch_identity(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    batch = random.sample(ACTIVE_WALLETS, min(100, len(ACTIVE_WALLETS)))
+    while len(batch) < 20:
+        batch.extend(ACTIVE_WALLETS)
+    batch = batch[:100]
+    url = f"{HELIUS_API}/v1/wallet/batch-identity?api-key={key}"
+    payload = {"addresses": batch}
+    async with session.post(url, json=payload) as resp:
+        return resp.status, "wallet_batch_identity"
+
+
+async def do_enhanced_transactions(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    if len(sig_pool) >= 100:
+        sigs = [sig_pool.popleft() for _ in range(100)]
+    else:
+        sigs = list(FALLBACK_SIGNATURES)
+        while len(sigs) < 100:
+            sigs.extend(FALLBACK_SIGNATURES)
+        sigs = sigs[:100]
+
+    url = f"{HELIUS_API}/v0/transactions?api-key={key}"
+    payload = {"transactions": sigs}
+    async with session.post(url, json=payload) as resp:
+        return resp.status, "enhanced_transactions"
+
+
+async def do_get_transactions_for_address(session: aiohttp.ClientSession, key: str) -> BurnResult:
+    wallet = random.choice(ACTIVE_WALLETS)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": random.randint(1, 10**9),
+        "method": "getTransactionsForAddress",
+        "params": [
+            wallet,
+            {
+                "transactionDetails": "full",
+                "limit": 1000,
+                "sortOrder": "desc",
+            },
+        ],
+    }
+    url = f"{HELIUS_RPC}/?api-key={key}"
+    async with session.post(url, json=payload) as resp:
+        if resp.status == 200:
+            try:
+                data = await resp.json()
+                for tx in data.get("result") or []:
+                    sig = tx.get("signature") or tx.get("transaction", {}).get("signatures", [None])[0]
+                    if sig:
+                        sig_pool.append(sig)
+            except Exception:
+                pass
+        return resp.status, "get_transactions_for_address"
+
+
+OP_MAP: Dict[str, Callable[[aiohttp.ClientSession, str], Awaitable[BurnResult]]] = {
     "get_slot": do_get_slot,
     "get_recent_block": do_get_recent_block,
     "get_program_accounts": do_get_program_accounts,
@@ -209,7 +371,15 @@ OP_MAP = {
     "search_assets": do_search_assets,
     "get_asset": do_get_asset,
     "get_signatures_for_address": do_get_signatures_for_address,
+    "wallet_balances": do_wallet_balances,
+    "wallet_history": do_wallet_history,
+    "wallet_transfers": do_wallet_transfers,
+    "wallet_identity": do_wallet_identity,
+    "wallet_batch_identity": do_wallet_batch_identity,
+    "enhanced_transactions": do_enhanced_transactions,
+    "get_transactions_for_address": do_get_transactions_for_address,
 }
+
 
 def build_weighted_pool(mode: str) -> List[str]:
     pool = OPERATION_POOLS.get(mode, OPERATION_POOLS["mixed"])
@@ -218,56 +388,138 @@ def build_weighted_pool(mode: str) -> List[str]:
         weighted.extend([op_name] * weight)
     return weighted
 
-async def worker(worker_id: int, session: aiohttp.ClientSession, keys: List[str], weighted_ops: List[str], stop_event: asyncio.Event, is_nuke: bool = False):
-    key_index = 0
-    while not stop_event.is_set() and keys:
-        # In nuke mode: fire multiple heavy calls per iteration with no delay
-        calls_this_loop = 3 if is_nuke else 1
 
-        for _ in range(calls_this_loop):
+def record_result(status: int, op_name: str) -> None:
+    stats = state["stats"]
+    stats["total"] += 1
+    if status == 200:
+        stats["success"] += 1
+        stats["credits_burned"] += CREDIT_COSTS.get(op_name, 1)
+    elif status == 429:
+        stats["rate_limited"] += 1
+        if stats["rate_limited"] % 500 == 1:
+            state["recent_logs"].append(
+                f"[{time.strftime('%H:%M:%S')}] 429 on {op_name} (total 429s: {stats['rate_limited']})"
+            )
+    else:
+        stats["errors"] += 1
+        if stats["errors"] % 100 == 1:
+            state["recent_logs"].append(
+                f"[{time.strftime('%H:%M:%S')}] HTTP {status} on {op_name}"
+            )
+
+
+async def worker(
+    worker_id: int,
+    session: aiohttp.ClientSession,
+    keys: List[str],
+    weighted_ops: List[str],
+    stop_event: asyncio.Event,
+    mode: str,
+):
+    key_index = worker_id
+    calls_per_loop = 3 if mode == "nuke" else (2 if mode == "obliterate" else 1)
+    backoff = 0.0
+
+    while not stop_event.is_set() and keys:
+        if backoff > 0:
+            await asyncio.sleep(backoff)
+
+        for _ in range(calls_per_loop):
             if stop_event.is_set():
                 break
+
             op_name = random.choice(weighted_ops)
             key = keys[key_index % len(keys)]
             key_index += 1
 
             try:
                 func = OP_MAP[op_name]
-                status = await func(session, key)
-
-                state["stats"]["total"] += 1
-                if status == 200:
-                    state["stats"]["success"] += 1
-                elif status == 429:
-                    state["stats"]["rate_limited"] += 1
-                    state["recent_logs"].append(f"[{time.strftime('%H:%M:%S')}] 429 on {op_name}")
-                else:
-                    state["stats"]["errors"] += 1
+                status, op_name = await func(session, key)
+                record_result(status, op_name)
+                if status == 429:
+                    backoff = min(0.05, backoff + 0.002)
+                elif status == 200:
+                    backoff = max(0.0, backoff - 0.001)
             except asyncio.CancelledError:
                 break
             except Exception:
-                state["stats"]["exceptions"] += 1
+                stats = state["stats"]
+                stats["exceptions"] += 1
 
-        # Only tiny sleep in non-nuke modes
-        if not is_nuke and random.random() < 0.05:
+        if mode not in AGGRESSIVE_MODES and random.random() < 0.05:
             await asyncio.sleep(0.0005)
+
+
+async def sig_harvester(
+    session: aiohttp.ClientSession,
+    keys: List[str],
+    stop_event: asyncio.Event,
+):
+    """Cheap 1-credit calls to fill sig pool for 100-credit enhanced tx batches."""
+    idx = 0
+    while not stop_event.is_set() and keys:
+        if len(sig_pool) >= 2000:
+            await asyncio.sleep(0.5)
+            continue
+
+        key = keys[idx % len(keys)]
+        idx += 1
+        addr = random.choice(ACTIVE_WALLETS)
+        payload = {
+            "jsonrpc": "2.0",
+            "id": random.randint(1, 10**9),
+            "method": "getSignaturesForAddress",
+            "params": [addr, {"limit": 1000}],
+        }
+        url = f"{HELIUS_RPC}/?api-key={key}"
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for entry in data.get("result") or []:
+                        sig = entry.get("signature")
+                        if sig:
+                            sig_pool.append(sig)
+                    state["stats"]["credits_burned"] += 1
+                    state["stats"]["success"] += 1
+                    state["stats"]["total"] += 1
+                elif resp.status == 429:
+                    state["stats"]["rate_limited"] += 1
+                    state["stats"]["total"] += 1
+                    await asyncio.sleep(0.1)
+                else:
+                    state["stats"]["errors"] += 1
+                    state["stats"]["total"] += 1
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            state["stats"]["exceptions"] += 1
+
+        await asyncio.sleep(0.02)
+
 
 async def stats_reporter(stop_event: asyncio.Event, start_time: float):
     last_total = 0
+    last_credits = 0
     while not stop_event.is_set():
         await asyncio.sleep(2.0)
-        now = time.time()
-        elapsed = now - start_time
         total = state["stats"]["total"]
+        credits = state["stats"]["credits_burned"]
         rps = (total - last_total) / 2.0
+        cps = (credits - last_credits) / 2.0
         last_total = total
+        last_credits = credits
         state["stats"]["current_rps"] = round(rps, 1)
+        state["stats"]["credit_rps"] = round(cps, 1)
 
-        # keep a simple log entry
         if rps > 0:
             state["recent_logs"].append(
-                f"[{time.strftime('%H:%M:%S')}] RPS: {rps:.1f} | Total: {total} | 429s: {state['stats']['rate_limited']}"
+                f"[{time.strftime('%H:%M:%S')}] {rps:.0f} req/s | "
+                f"{cps:,.0f} cr/s | burned: {credits:,.0f} | "
+                f"429s: {state['stats']['rate_limited']}"
             )
+
 
 async def start_burner():
     if state["running"] or not state["keys"]:
@@ -276,24 +528,33 @@ async def start_burner():
     state["running"] = True
     state["start_time"] = time.time()
     state["stop_event"] = asyncio.Event()
-    state["stats"] = {k: 0 for k in state["stats"]}
-    state["stats"]["current_rps"] = 0.0
+    state["stats"] = {
+        "total": 0,
+        "success": 0,
+        "rate_limited": 0,
+        "errors": 0,
+        "exceptions": 0,
+        "current_rps": 0.0,
+        "credits_burned": 0,
+        "credit_rps": 0.0,
+    }
+    sig_pool.clear()
     state["recent_logs"].clear()
     state["recent_logs"].append("=== BURN STARTED ===")
 
-    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
-    timeout = aiohttp.ClientTimeout(total=30)
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
     session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     state["session"] = session
 
     weighted = build_weighted_pool(state["mode"])
     concurrency = max(1, int(state["concurrency"]))
-    is_nuke = state["mode"] == "nuke"
+    mode = state["mode"]
 
     tasks = []
     for i in range(concurrency):
         t = asyncio.create_task(
-            worker(i, session, state["keys"], weighted, state["stop_event"], is_nuke=is_nuke)
+            worker(i, session, state["keys"], weighted, state["stop_event"], mode)
         )
         tasks.append(t)
 
@@ -301,12 +562,19 @@ async def start_burner():
     state["tasks"] = tasks
     state["reporter_task"] = reporter
 
-    # Start health server if on Railway
-    if os.getenv("PORT") or os.getenv("RAILWAY_ENVIRONMENT"):
-        asyncio.create_task(start_health_server())
+    if mode == "obliterate":
+        harvester = asyncio.create_task(
+            sig_harvester(session, state["keys"], state["stop_event"])
+        )
+        state["harvester_task"] = harvester
+        tasks.append(harvester)
 
-    state["recent_logs"].append(f"Burner started with {concurrency} workers in {state['mode']} mode")
+    state["recent_logs"].append(
+        f"Burner started: {concurrency} workers, mode={mode}, "
+        f"keys={len(state['keys'])}"
+    )
     return True
+
 
 async def stop_burner():
     if not state["running"]:
@@ -321,42 +589,28 @@ async def stop_burner():
     if state["reporter_task"]:
         state["reporter_task"].cancel()
 
+    if state["harvester_task"]:
+        state["harvester_task"].cancel()
+
     if state["session"]:
         await state["session"].close()
 
     state["running"] = False
     state["tasks"] = []
     state["reporter_task"] = None
+    state["harvester_task"] = None
     state["session"] = None
     state["recent_logs"].append("=== BURN STOPPED ===")
 
-async def start_health_server():
-    """Minimal health endpoint so Railway doesn't think we're dead."""
-    port = int(os.getenv("PORT", "8080"))
-    app = web.Application()
-
-    async def health(_):
-        return web.Response(text="BURNER ALIVE")
-
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    state["recent_logs"].append(f"Health server on port {port}")
 
 # ==================== FASTAPI APP ====================
 
 app = FastAPI(title="Helius Quota Burner Dashboard")
-
-# Templates (we'll use inline HTML for simplicity + one index route)
 templates = Jinja2Templates(directory=".")
+
 
 @app.on_event("startup")
 async def startup_event():
-    # Load defaults from env if present
     env_keys = os.getenv("HELIUS_KEYS") or os.getenv("HELIUS_KEY", "")
     if env_keys:
         state["keys"] = [k.strip() for k in env_keys.split(",") if k.strip()]
@@ -369,26 +623,31 @@ async def startup_event():
     if env_mode in OPERATION_POOLS:
         state["mode"] = env_mode
 
-    state["recent_logs"].append("Dashboard started. Ready to burn.")
+    state["recent_logs"].append("Dashboard ready. OBLITERATE mode available.")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await stop_burner()
 
-# ==================== API ENDPOINTS ====================
 
 @app.get("/api/stats")
 async def get_stats():
     elapsed = time.time() - state["start_time"] if state["running"] else 0
+    credits = state["stats"].get("credits_burned", 0)
+    credits_per_hour = (credits / elapsed * 3600) if elapsed > 0 else 0
     return JSONResponse({
         "running": state["running"],
         "keys_count": len(state["keys"]),
         "concurrency": state["concurrency"],
         "mode": state["mode"],
         "elapsed": round(elapsed, 1),
+        "sig_pool_size": len(sig_pool),
+        "credits_per_hour": round(credits_per_hour),
         "stats": state["stats"],
-        "recent_logs": list(state["recent_logs"])[-15:],
+        "recent_logs": list(state["recent_logs"])[-20:],
     })
+
 
 @app.post("/api/keys")
 async def set_keys(keys_text: str = Form(...)):
@@ -396,52 +655,69 @@ async def set_keys(keys_text: str = Form(...)):
     new_keys = []
     for line in raw_lines:
         key = None
-        # Handle full Helius URL with api-key param (even without protocol)
         if "api-key=" in line:
             try:
                 after = line.split("api-key=")[1]
                 key = after.split("&")[0].split(" ")[0].strip()
-            except:
+            except Exception:
                 pass
-        elif line.startswith("http") or "helius-rpc.com" in line.lower():
-            # full URL, try to extract anyway
-            if "api-key=" in line:
-                try:
-                    after = line.split("api-key=")[1]
-                    key = after.split("&")[0].strip()
-                except:
-                    pass
         else:
-            # plain key
             key = line.strip()
 
-        if key and len(key) > 10:  # basic sanity check for Helius key format
+        if key and len(key) > 10:
             new_keys.append(key)
 
-    # dedupe while preserving order
     seen = set()
     new_keys = [k for k in new_keys if not (k in seen or seen.add(k))]
     state["keys"] = new_keys
     state["recent_logs"].append(f"Updated keys ({len(new_keys)} total)")
     return {"ok": True, "count": len(new_keys)}
 
+
 @app.post("/api/config")
 async def set_config(concurrency: int = Form(...), mode: str = Form(...)):
     if mode in OPERATION_POOLS:
         state["mode"] = mode
-    state["concurrency"] = max(1, min(500, concurrency))  # safety cap
-    state["recent_logs"].append(f"Config updated: {state['concurrency']} workers, mode={state['mode']}")
+    state["concurrency"] = max(1, min(MAX_CONCURRENCY, concurrency))
+    state["recent_logs"].append(
+        f"Config: {state['concurrency']} workers, mode={state['mode']}"
+    )
     return {"ok": True}
+
 
 @app.post("/api/start")
 async def api_start():
     success = await start_burner()
     return {"ok": success, "message": "Burner started" if success else "Already running or no keys"}
 
+
 @app.post("/api/stop")
 async def api_stop():
     await stop_burner()
     return {"ok": True, "message": "Burner stopped"}
+
+
+@app.post("/api/obliterate")
+async def api_obliterate():
+    """One-click max destruction: obliterate mode + high concurrency."""
+    await stop_burner()
+    state["mode"] = "obliterate"
+    state["concurrency"] = int(os.getenv("OBLITERATE_CONCURRENCY", "800"))
+    success = await start_burner()
+    return {
+        "ok": success,
+        "message": f"OBLITERATE started ({state['concurrency']} workers)" if success else "Failed",
+    }
+
+
+@app.post("/api/nuke")
+async def api_nuke():
+    await stop_burner()
+    state["mode"] = "nuke"
+    state["concurrency"] = 400
+    success = await start_burner()
+    return {"ok": success, "message": "NUKE started" if success else "Failed"}
+
 
 # ==================== DASHBOARD UI ====================
 
@@ -451,187 +727,167 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HELIUS BURNER • Dashboard</title>
+    <title>HELIUS BURNER • OBLITERATE</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap');
-        body { font-family: 'Inter', system_ui, sans-serif; }
+        body { font-family: 'Inter', system-ui, sans-serif; }
         .font-display { font-family: 'Space Grotesk', 'Inter', sans-serif; }
-        .burn-red { color: #ef4444; }
         .stat-card { transition: all 0.1s ease; }
         .log-line { font-family: ui-monospace, monospace; font-size: 0.75rem; }
     </style>
 </head>
 <body class="bg-zinc-950 text-zinc-200">
     <div class="max-w-6xl mx-auto p-6">
-        <!-- Header -->
         <div class="flex items-center justify-between mb-8">
-            <div>
-                <div class="flex items-center gap-3">
-                    <div class="w-10 h-10 bg-red-600 rounded-2xl flex items-center justify-center text-white font-bold text-2xl">🔥</div>
-                    <div>
-                        <h1 class="text-4xl font-semibold tracking-tighter font-display">HELIUS BURNER</h1>
-                        <p class="text-red-500 text-sm -mt-1">Maximum pointless quota consumption</p>
-                    </div>
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-red-600 rounded-2xl flex items-center justify-center text-2xl">💀</div>
+                <div>
+                    <h1 class="text-4xl font-semibold tracking-tighter font-display">HELIUS BURNER</h1>
+                    <p class="text-red-500 text-sm -mt-1">OBLITERATE — 100-credit endpoints</p>
                 </div>
             </div>
-            <div id="status-badge" 
-                 class="px-4 py-1.5 rounded-3xl text-sm font-medium flex items-center gap-2 border border-zinc-800 bg-zinc-900">
+            <div id="status-badge" class="px-4 py-1.5 rounded-3xl text-sm font-medium flex items-center gap-2 border border-zinc-800 bg-zinc-900">
                 <div class="w-2 h-2 rounded-full bg-zinc-500" id="status-dot"></div>
                 <span id="status-text">STOPPED</span>
             </div>
         </div>
 
-        <!-- Big Warning -->
         <div class="mb-6 p-4 bg-red-950 border border-red-900 rounded-3xl text-red-400 text-sm">
-            <strong>EXTREME WARNING:</strong> This tool exists to waste Helius quota as fast as humanly possible using expensive RPC calls.
-            Only use keys you personally own. Misuse can get you banned or worse.
+            <strong>OBLITERATE MODE:</strong> Wallet API + Enhanced Transactions + getTransactionsForAddress
+            (100 credits each). Only use keys you own.
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            
-            <!-- Controls -->
             <div class="lg:col-span-5 bg-zinc-900 border border-zinc-800 rounded-3xl p-6">
-                <h2 class="font-semibold text-lg mb-4 flex items-center gap-2">
-                    <span>⚙️</span> 
-                    <span>Controls</span>
-                </h2>
+                <h2 class="font-semibold text-lg mb-4">Controls</h2>
 
-                <!-- Keys -->
                 <div class="mb-5">
-                    <label class="block text-xs font-medium text-zinc-400 mb-1.5">HELIUS KEYS (one per line)</label>
-                    <textarea id="keys-text" rows="4" 
-                              class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm font-mono resize-y"
-                              placeholder="Paste full URL or just the key&#10;mainnet.helius-rpc.com/?api-key=xxx&#10;or just xxx"></textarea>
-                    <button onclick="saveKeys()" 
-                            class="mt-2 text-xs px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-2xl transition">
-                        Save Keys
-                    </button>
+                    <label class="block text-xs font-medium text-zinc-400 mb-1.5">HELIUS KEYS</label>
+                    <textarea id="keys-text" rows="4"
+                        class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm font-mono resize-y"
+                        placeholder="api-key per line or full URL"></textarea>
+                    <button onclick="saveKeys()" class="mt-2 text-xs px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-2xl">Save Keys</button>
                 </div>
 
-                <!-- Config -->
                 <div class="grid grid-cols-2 gap-4 mb-6">
                     <div>
                         <label class="block text-xs font-medium text-zinc-400 mb-1.5">CONCURRENCY</label>
-                        <input type="number" id="concurrency" value="150" 
-                               class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-lg font-semibold">
-                        <input type="range" id="concurrency-slider" min="10" max="400" step="10" value="150"
-                               class="w-full accent-red-600 mt-1" oninput="document.getElementById('concurrency').value=this.value">
+                        <input type="number" id="concurrency" value="800"
+                            class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-lg font-semibold">
+                        <input type="range" id="concurrency-slider" min="50" max="2000" step="50" value="800"
+                            class="w-full accent-red-600 mt-1"
+                            oninput="document.getElementById('concurrency').value=this.value">
                     </div>
                     <div>
                         <label class="block text-xs font-medium text-zinc-400 mb-1.5">MODE</label>
                         <select id="mode" class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm">
-                            <option value="nuke">☢️ NUKE (MAX DESTRUCTION)</option>
-                            <option value="expensive">EXPENSIVE (max pain)</option>
+                            <option value="obliterate">💀 OBLITERATE (100cr/call)</option>
+                            <option value="nuke">☢️ NUKE (10cr/call)</option>
+                            <option value="expensive">EXPENSIVE</option>
                             <option value="mixed">MIXED</option>
                             <option value="das-heavy">DAS-HEAVY</option>
-                            <option value="basic">BASIC (weaker)</option>
+                            <option value="basic">BASIC</option>
                         </select>
                     </div>
                 </div>
 
-                <button onclick="applyConfig()" 
-                        class="w-full mb-3 py-2.5 text-sm bg-zinc-800 hover:bg-zinc-700 rounded-2xl transition">
-                    Apply Config
-                </button>
+                <button onclick="applyConfig()" class="w-full mb-3 py-2.5 text-sm bg-zinc-800 hover:bg-zinc-700 rounded-2xl">Apply Config</button>
 
-                <!-- Big Buttons -->
-                <div class="flex gap-3">
-                    <button onclick="startBurn()" 
-                            class="flex-1 py-4 text-lg font-semibold bg-red-600 hover:bg-red-500 active:bg-red-700 rounded-3xl transition flex items-center justify-center gap-2">
-                        <span>🔥 START BURN</span>
-                    </button>
-                    <button onclick="stopBurn()" 
-                            class="flex-1 py-4 text-lg font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-3xl transition">
-                        STOP
-                    </button>
+                <div class="flex gap-3 mb-3">
+                    <button onclick="startBurn()" class="flex-1 py-3 font-semibold bg-red-600 hover:bg-red-500 rounded-3xl">START</button>
+                    <button onclick="stopBurn()" class="flex-1 py-3 font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-3xl">STOP</button>
                 </div>
 
-                <!-- Nuke Button - instant max destruction -->
-                <button onclick="nukeMode()" 
-                        class="mt-3 w-full py-5 text-xl font-bold bg-gradient-to-r from-red-700 via-red-600 to-orange-600 hover:from-red-600 hover:to-red-500 active:scale-[0.985] rounded-3xl transition flex items-center justify-center gap-3 shadow-xl shadow-red-950">
-                    <span class="text-2xl">☢️</span>
-                    <span>NUKE MODE - MAX SPEED TO ZERO</span>
+                <button onclick="obliterateMode()"
+                    class="w-full py-6 text-xl font-bold bg-gradient-to-r from-purple-900 via-red-700 to-red-600 hover:from-purple-800 hover:to-red-500 rounded-3xl shadow-xl shadow-red-950 flex items-center justify-center gap-3">
+                    <span class="text-3xl">💀</span>
+                    <span>OBLITERATE — MAX CREDIT BURN</span>
                 </button>
-                <p class="text-[10px] text-center text-red-500/70 mt-1">Sets 400 workers + nuke mode + starts immediately</p>
+                <p class="text-[10px] text-center text-red-500/70 mt-1">800 workers + Wallet API + Enhanced TX + GTF (100 credits each)</p>
+
+                <button onclick="nukeMode()" class="mt-2 w-full py-3 text-sm font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-2xl">
+                    ☢️ Legacy NUKE (10cr endpoints)
+                </button>
             </div>
 
-            <!-- Live Stats -->
             <div class="lg:col-span-7 bg-zinc-900 border border-zinc-800 rounded-3xl p-6">
                 <h2 class="font-semibold text-lg mb-4">LIVE STATS</h2>
-                
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-                    <div class="stat-card bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
-                        <div class="text-xs text-zinc-500">CURRENT RPS</div>
-                        <div id="rps" class="text-4xl font-semibold tabular-nums text-red-500 mt-1">0.0</div>
+
+                <div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-4">
+                    <div class="stat-card bg-red-950/50 border border-red-900 rounded-2xl p-4 col-span-2 md:col-span-1">
+                        <div class="text-xs text-red-400">CREDITS BURNED</div>
+                        <div id="credits" class="text-3xl font-semibold tabular-nums text-red-400 mt-1">0</div>
+                        <div class="text-[10px] text-zinc-500 mt-1"><span id="credit-rps">0</span> cr/s · <span id="credits-hour">0</span>/h</div>
                     </div>
                     <div class="stat-card bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
-                        <div class="text-xs text-zinc-500">TOTAL REQUESTS</div>
-                        <div id="total" class="text-4xl font-semibold tabular-nums mt-1">0</div>
+                        <div class="text-xs text-zinc-500">REQUESTS/S</div>
+                        <div id="rps" class="text-3xl font-semibold tabular-nums text-orange-400 mt-1">0</div>
                     </div>
                     <div class="stat-card bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
-                        <div class="text-xs text-zinc-500">429 RATE LIMITED</div>
-                        <div id="rate-limited" class="text-4xl font-semibold tabular-nums text-orange-400 mt-1">0</div>
+                        <div class="text-xs text-zinc-500">SUCCESS (200)</div>
+                        <div id="success" class="text-3xl font-semibold tabular-nums text-green-400 mt-1">0</div>
+                    </div>
+                    <div class="stat-card bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
+                        <div class="text-xs text-zinc-500">429 LIMITED</div>
+                        <div id="rate-limited" class="text-3xl font-semibold tabular-nums text-orange-400 mt-1">0</div>
                     </div>
                     <div class="stat-card bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
                         <div class="text-xs text-zinc-500">ERRORS</div>
-                        <div id="errors" class="text-4xl font-semibold tabular-nums mt-1">0</div>
+                        <div id="errors" class="text-3xl font-semibold tabular-nums mt-1">0</div>
+                    </div>
+                    <div class="stat-card bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
+                        <div class="text-xs text-zinc-500">SIG POOL</div>
+                        <div id="sig-pool" class="text-3xl font-semibold tabular-nums text-purple-400 mt-1">0</div>
                     </div>
                 </div>
 
-                <div class="flex items-center gap-6 text-sm">
-                    <div>
-                        <span class="text-zinc-500">Elapsed:</span> 
-                        <span id="elapsed" class="font-mono font-semibold">0s</span>
-                    </div>
-                    <div>
-                        <span class="text-zinc-500">Workers:</span> 
-                        <span id="workers" class="font-semibold">0</span>
-                    </div>
-                    <div>
-                        <span class="text-zinc-500">Keys loaded:</span> 
-                        <span id="keys-count" class="font-semibold">0</span>
-                    </div>
-                    <div id="mode-display" class="px-3 py-0.5 bg-zinc-800 rounded-2xl text-xs font-medium"></div>
+                <div class="flex flex-wrap items-center gap-4 text-sm">
+                    <div><span class="text-zinc-500">Elapsed:</span> <span id="elapsed" class="font-mono font-semibold">0s</span></div>
+                    <div><span class="text-zinc-500">Workers:</span> <span id="workers" class="font-semibold">0</span></div>
+                    <div><span class="text-zinc-500">Keys:</span> <span id="keys-count" class="font-semibold">0</span></div>
+                    <div id="mode-display" class="px-3 py-0.5 bg-red-900 rounded-2xl text-xs font-medium text-red-300"></div>
                 </div>
             </div>
 
-            <!-- Logs -->
             <div class="lg:col-span-12 bg-zinc-900 border border-zinc-800 rounded-3xl p-6">
                 <div class="flex justify-between items-center mb-3">
-                    <h2 class="font-semibold">Burn Log (last activity)</h2>
+                    <h2 class="font-semibold">Burn Log</h2>
                     <button onclick="refreshStats()" class="text-xs px-3 py-1 bg-zinc-800 rounded-2xl hover:bg-zinc-700">Refresh</button>
                 </div>
-                <div id="log-container" 
-                     class="bg-black border border-zinc-800 rounded-2xl p-3 h-64 overflow-auto font-mono text-xs text-zinc-400 space-y-0.5">
-                    <!-- populated by JS -->
-                </div>
+                <div id="log-container" class="bg-black border border-zinc-800 rounded-2xl p-3 h-64 overflow-auto font-mono text-xs text-zinc-400 space-y-0.5"></div>
             </div>
-        </div>
-
-        <div class="mt-6 text-[10px] text-center text-zinc-600">
-            Goal: maximum pointless RPC calls. Use responsibly. • Railway edition
         </div>
     </div>
 
     <script>
         let pollInterval = null;
 
+        function fmt(n) {
+            if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+            if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+            return Math.round(n).toLocaleString();
+        }
+
         async function refreshStats() {
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
+                const s = data.stats;
 
-                document.getElementById('rps').textContent = data.stats.current_rps.toFixed(1);
-                document.getElementById('total').textContent = data.stats.total.toLocaleString();
-                document.getElementById('rate-limited').textContent = data.stats.rate_limited.toLocaleString();
-                document.getElementById('errors').textContent = (data.stats.errors + data.stats.exceptions).toLocaleString();
+                document.getElementById('credits').textContent = fmt(s.credits_burned || 0);
+                document.getElementById('credit-rps').textContent = fmt(s.credit_rps || 0);
+                document.getElementById('credits-hour').textContent = fmt(data.credits_per_hour || 0);
+                document.getElementById('rps').textContent = (s.current_rps || 0).toFixed(1);
+                document.getElementById('success').textContent = (s.success || 0).toLocaleString();
+                document.getElementById('rate-limited').textContent = (s.rate_limited || 0).toLocaleString();
+                document.getElementById('errors').textContent = ((s.errors || 0) + (s.exceptions || 0)).toLocaleString();
+                document.getElementById('sig-pool').textContent = (data.sig_pool_size || 0).toLocaleString();
                 document.getElementById('elapsed').textContent = data.elapsed + 's';
                 document.getElementById('workers').textContent = data.concurrency;
                 document.getElementById('keys-count').textContent = data.keys_count;
                 document.getElementById('mode-display').textContent = data.mode.toUpperCase();
 
-                // Status
                 const badge = document.getElementById('status-badge');
                 const dot = document.getElementById('status-dot');
                 const text = document.getElementById('status-text');
@@ -640,7 +896,7 @@ DASHBOARD_HTML = """
                     badge.classList.add('!border-red-600', 'bg-red-950');
                     dot.classList.add('bg-red-500');
                     dot.classList.remove('bg-zinc-500');
-                    text.textContent = 'BURNING';
+                    text.textContent = data.mode === 'obliterate' ? 'OBLITERATING' : 'BURNING';
                     text.classList.add('text-red-400');
                 } else {
                     badge.classList.remove('!border-red-600', 'bg-red-950');
@@ -650,7 +906,6 @@ DASHBOARD_HTML = """
                     text.classList.remove('text-red-400');
                 }
 
-                // Logs
                 const logEl = document.getElementById('log-container');
                 logEl.innerHTML = '';
                 data.recent_logs.slice().reverse().forEach(line => {
@@ -659,30 +914,21 @@ DASHBOARD_HTML = """
                     div.textContent = line;
                     logEl.appendChild(div);
                 });
-
-            } catch(e) {
-                console.error(e);
-            }
+            } catch(e) { console.error(e); }
         }
 
         async function saveKeys() {
-            const text = document.getElementById('keys-text').value;
             const form = new FormData();
-            form.append('keys_text', text);
-            
+            form.append('keys_text', document.getElementById('keys-text').value);
             await fetch('/api/keys', { method: 'POST', body: form });
             await refreshStats();
-            alert('Keys saved. Start burner to use them.');
+            alert('Keys saved.');
         }
 
         async function applyConfig() {
-            const conc = parseInt(document.getElementById('concurrency').value);
-            const mode = document.getElementById('mode').value;
-            
             const form = new FormData();
-            form.append('concurrency', conc);
-            form.append('mode', mode);
-            
+            form.append('concurrency', parseInt(document.getElementById('concurrency').value));
+            form.append('mode', document.getElementById('mode').value);
             await fetch('/api/config', { method: 'POST', body: form });
             await refreshStats();
         }
@@ -690,7 +936,7 @@ DASHBOARD_HTML = """
         async function startBurn() {
             const res = await fetch('/api/start', { method: 'POST' });
             const data = await res.json();
-            if (!data.ok) alert(data.message || 'Failed to start');
+            if (!data.ok) alert(data.message || 'Failed');
             setTimeout(refreshStats, 300);
         }
 
@@ -699,57 +945,33 @@ DASHBOARD_HTML = """
             setTimeout(refreshStats, 300);
         }
 
-        async function nukeMode() {
-            // Instant nuke: max aggression
-            document.getElementById('concurrency').value = 400;
-            document.getElementById('concurrency-slider').value = 400;
-            document.getElementById('mode').value = 'nuke';
-
-            // Apply config
-            const form = new FormData();
-            form.append('concurrency', 400);
-            form.append('mode', 'nuke');
-            await fetch('/api/config', { method: 'POST', body: form });
-
-            // Start immediately
-            const res = await fetch('/api/start', { method: 'POST' });
+        async function obliterateMode() {
+            document.getElementById('concurrency').value = 800;
+            document.getElementById('concurrency-slider').value = 800;
+            document.getElementById('mode').value = 'obliterate';
+            const res = await fetch('/api/obliterate', { method: 'POST' });
             const data = await res.json();
-            if (!data.ok) alert(data.message || 'Failed to nuke');
+            if (!data.ok) alert(data.message || 'Failed');
             setTimeout(refreshStats, 400);
         }
 
-        // Load initial values
+        async function nukeMode() {
+            const res = await fetch('/api/nuke', { method: 'POST' });
+            const data = await res.json();
+            if (!data.ok) alert(data.message || 'Failed');
+            setTimeout(refreshStats, 400);
+        }
+
         async function loadInitial() {
             const res = await fetch('/api/stats');
             const data = await res.json();
-            
-            // Prefill keys if any (from env or previous)
-            if (data.keys_count > 0) {
-                // We don't expose keys for security, just count
-            }
-            
             document.getElementById('concurrency').value = data.concurrency;
-            document.getElementById('concurrency-slider').value = data.concurrency;
+            document.getElementById('concurrency-slider').value = Math.min(2000, data.concurrency);
             document.getElementById('mode').value = data.mode;
-
             await refreshStats();
-            
-            // Start polling
             if (pollInterval) clearInterval(pollInterval);
-            pollInterval = setInterval(refreshStats, 2200);
+            pollInterval = setInterval(refreshStats, 2000);
         }
-
-        // Keyboard shortcut
-        document.addEventListener('keydown', function(e) {
-            if (e.key === '/' && document.activeElement.tagName === 'BODY') {
-                e.preventDefault();
-                document.getElementById('keys-text').focus();
-            }
-            if (e.key.toLowerCase() === 's' && e.metaKey) {
-                e.preventDefault();
-                startBurn();
-            }
-        });
 
         window.onload = loadInitial;
     </script>
@@ -757,11 +979,11 @@ DASHBOARD_HTML = """
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     return HTMLResponse(DASHBOARD_HTML)
 
-# ==================== RUN ====================
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
