@@ -27,10 +27,13 @@ import uvicorn
 HELIUS_RPC = "https://mainnet.helius-rpc.com"
 HELIUS_API = "https://api.helius.xyz"
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "500"))
-# Railway containers choke on hundreds of bare asyncio tasks — cap task count,
-# use a semaphore for actual in-flight HTTP concurrency instead.
 MAX_WORKER_TASKS = int(os.getenv("MAX_WORKER_TASKS", "48"))
 DEFAULT_OBLITERATE_CONCURRENCY = int(os.getenv("OBLITERATE_CONCURRENCY", "200"))
+# Professional tier has SEPARATE rate limits: Wallet/DAS/Enhanced = 100/s, RPC = 500/s.
+# Dual-lane mode saturates both buckets in parallel.
+PRO_WALLET_CONCURRENCY = int(os.getenv("PRO_WALLET_CONCURRENCY", "100"))
+PRO_RPC_CONCURRENCY = int(os.getenv("PRO_RPC_CONCURRENCY", "250"))
+SIG_HARVESTERS = int(os.getenv("SIG_HARVESTERS", "12"))
 
 KNOWN_PROGRAMS = [
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -69,8 +72,10 @@ FALLBACK_SIGNATURES = [
     "2nBhEBYYvfaAe16UMNqRHre4YNSskvuYgx3M6E4JP1oDYvZEJHvoPzyUidNgX5e8ERochnyq1wYWpa5f9KUF9",
 ]
 
-sig_pool: deque = deque(maxlen=10000)
+sig_pool: deque = deque(maxlen=50000)
 inflight_sem: Optional[asyncio.Semaphore] = None
+wallet_sem: Optional[asyncio.Semaphore] = None
+rpc_sem: Optional[asyncio.Semaphore] = None
 
 state: Dict[str, Any] = {
     "keys": [],
@@ -130,7 +135,6 @@ OPERATION_POOLS = {
         ("get_slot", 1),
     ],
     "obliterate": [
-        # 100-credit endpoints — maximum destruction
         ("enhanced_transactions", 18),
         ("wallet_balances", 14),
         ("wallet_history", 14),
@@ -142,7 +146,28 @@ OPERATION_POOLS = {
         ("search_assets", 2),
         ("get_assets_by_owner", 2),
     ],
+    # Professional max: dual-lane 100cr-only, no 10cr waste
+    "annihilate": [],
 }
+
+# Split pools for dual-lane Professional saturation
+WALLET_LANE_POOL = [
+    ("enhanced_transactions", 10),
+    ("wallet_balances", 8),
+    ("wallet_history", 8),
+    ("wallet_transfers", 7),
+    ("wallet_batch_identity", 6),
+    ("wallet_identity", 5),
+]
+RPC_LANE_POOL = [
+    ("get_transactions_for_address", 10),
+]
+
+WALLET_LANE_OPS = frozenset({
+    "wallet_balances", "wallet_history", "wallet_transfers",
+    "wallet_identity", "wallet_batch_identity", "enhanced_transactions",
+})
+RPC_LANE_OPS = frozenset({"get_transactions_for_address"})
 
 # Helius credit cost per successful call
 CREDIT_COSTS: Dict[str, int] = {
@@ -162,7 +187,7 @@ CREDIT_COSTS: Dict[str, int] = {
     "get_transactions_for_address": 100,
 }
 
-AGGRESSIVE_MODES = frozenset({"nuke", "obliterate"})
+AGGRESSIVE_MODES = frozenset({"nuke", "obliterate", "annihilate"})
 
 # ==================== BURN OPERATIONS ====================
 
@@ -393,12 +418,26 @@ OP_MAP: Dict[str, Callable[[aiohttp.ClientSession, str], Awaitable[BurnResult]]]
 }
 
 
-def build_weighted_pool(mode: str) -> List[str]:
-    pool = OPERATION_POOLS.get(mode, OPERATION_POOLS["mixed"])
+def build_weighted_pool_from_defs(defs: List[tuple]) -> List[str]:
     weighted = []
-    for op_name, weight in pool:
+    for op_name, weight in defs:
         weighted.extend([op_name] * weight)
     return weighted
+
+
+def build_weighted_pool(mode: str) -> List[str]:
+    if mode == "annihilate":
+        return build_weighted_pool_from_defs(WALLET_LANE_POOL + RPC_LANE_POOL)
+    pool = OPERATION_POOLS.get(mode, OPERATION_POOLS["mixed"])
+    return build_weighted_pool_from_defs(pool)
+
+
+def lane_for_op(op_name: str) -> str:
+    if op_name in WALLET_LANE_OPS:
+        return "wallet"
+    if op_name in RPC_LANE_OPS:
+        return "rpc"
+    return "default"
 
 
 def record_result(status: int, op_name: str) -> None:
@@ -426,14 +465,21 @@ async def execute_burn_op(
     keys: List[str],
     weighted_ops: List[str],
     key_index: int,
+    forced_op: Optional[str] = None,
 ) -> int:
-    """Run one burn operation under the global semaphore."""
-    global inflight_sem
-    op_name = random.choice(weighted_ops)
+    """Run one burn operation under the appropriate rate-limit lane semaphore."""
+    global inflight_sem, wallet_sem, rpc_sem
+    op_name = forced_op or random.choice(weighted_ops)
     key = keys[key_index % len(keys)]
+    lane = lane_for_op(op_name)
+    sem = inflight_sem
+    if lane == "wallet" and wallet_sem is not None:
+        sem = wallet_sem
+    elif lane == "rpc" and rpc_sem is not None:
+        sem = rpc_sem
 
     try:
-        async with inflight_sem:
+        async with sem:
             func = OP_MAP[op_name]
             status, op_name = await func(session, key)
         record_result(status, op_name)
@@ -459,7 +505,14 @@ async def worker(
     mode: str,
 ):
     key_index = worker_id
-    calls_per_loop = 3 if mode == "nuke" else (2 if mode == "obliterate" else 1)
+    if mode == "annihilate":
+        calls_per_loop = 1
+    elif mode == "nuke":
+        calls_per_loop = 3
+    elif mode == "obliterate":
+        calls_per_loop = 2
+    else:
+        calls_per_loop = 1
     backoff = 0.0
 
     while not stop_event.is_set() and keys:
@@ -474,14 +527,45 @@ async def worker(
                 status = await execute_burn_op(session, keys, weighted_ops, key_index)
                 key_index += 1
                 if status == 429:
-                    backoff = min(0.1, backoff + 0.005)
+                    backoff = min(0.15, backoff + 0.01)
                 elif status == 200:
-                    backoff = max(0.0, backoff - 0.002)
+                    backoff = max(0.0, backoff - 0.003)
             except asyncio.CancelledError:
                 break
 
-        # Yield so FastAPI can still serve /api/stats while burning
-        await asyncio.sleep(0.002 if mode in AGGRESSIVE_MODES else 0.01)
+        if mode == "annihilate":
+            await asyncio.sleep(0)
+        elif mode in AGGRESSIVE_MODES:
+            await asyncio.sleep(0.001)
+        else:
+            await asyncio.sleep(0.01)
+
+
+async def lane_worker(
+    worker_id: int,
+    session: aiohttp.ClientSession,
+    keys: List[str],
+    lane_ops: List[str],
+    stop_event: asyncio.Event,
+):
+    """Dedicated worker for one Professional rate-limit lane."""
+    key_index = worker_id
+    backoff = 0.0
+    while not stop_event.is_set() and keys:
+        if backoff > 0:
+            await asyncio.sleep(backoff)
+        try:
+            status = await execute_burn_op(
+                session, keys, lane_ops, key_index, forced_op=random.choice(lane_ops)
+            )
+            key_index += 1
+            if status == 429:
+                backoff = min(0.2, backoff + 0.015)
+            elif status == 200:
+                backoff = max(0.0, backoff - 0.005)
+        except asyncio.CancelledError:
+            break
+        await asyncio.sleep(0)
 
 
 async def sig_harvester(
@@ -529,7 +613,7 @@ async def sig_harvester(
         except Exception:
             state["stats"]["exceptions"] += 1
 
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.005)
 
 
 async def stats_reporter(stop_event: asyncio.Event, start_time: float):
@@ -560,7 +644,7 @@ async def start_burner() -> Tuple[bool, str]:
     if not state["keys"]:
         return False, "No keys loaded — paste key and click Save Keys first"
 
-    global inflight_sem
+    global inflight_sem, wallet_sem, rpc_sem
     state["running"] = True
     state["start_time"] = time.time()
     state["stop_event"] = asyncio.Event()
@@ -578,7 +662,57 @@ async def start_burner() -> Tuple[bool, str]:
     state["recent_logs"].clear()
     state["recent_logs"].append("=== BURN STARTED ===")
 
+    mode = state["mode"]
+    tasks = []
+
+    if mode == "annihilate":
+        wallet_sem = asyncio.Semaphore(PRO_WALLET_CONCURRENCY)
+        rpc_sem = asyncio.Semaphore(PRO_RPC_CONCURRENCY)
+        inflight_sem = asyncio.Semaphore(PRO_WALLET_CONCURRENCY + PRO_RPC_CONCURRENCY)
+        total_conn = PRO_WALLET_CONCURRENCY + PRO_RPC_CONCURRENCY + 20
+        wallet_pool = build_weighted_pool_from_defs(WALLET_LANE_POOL)
+        rpc_pool = build_weighted_pool_from_defs(RPC_LANE_POOL)
+        wallet_tasks = min(64, max(16, PRO_WALLET_CONCURRENCY // 2))
+        rpc_tasks = min(64, max(16, PRO_RPC_CONCURRENCY // 4))
+
+        connector = aiohttp.TCPConnector(
+            limit=total_conn, limit_per_host=total_conn,
+            ttl_dns_cache=300, enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=55)
+        session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        state["session"] = session
+
+        for i in range(wallet_tasks):
+            tasks.append(asyncio.create_task(
+                lane_worker(i, session, state["keys"], wallet_pool, state["stop_event"])
+            ))
+        for i in range(rpc_tasks):
+            tasks.append(asyncio.create_task(
+                lane_worker(i + wallet_tasks, session, state["keys"], rpc_pool, state["stop_event"])
+            ))
+        for i in range(SIG_HARVESTERS):
+            tasks.append(asyncio.create_task(
+                sig_harvester(session, state["keys"], state["stop_event"])
+            ))
+
+        reporter = asyncio.create_task(stats_reporter(state["stop_event"], state["start_time"]))
+        state["tasks"] = tasks
+        state["reporter_task"] = reporter
+        state["harvester_task"] = None
+
+        state["recent_logs"].append(
+            f"ANNIHILATE dual-lane: wallet={PRO_WALLET_CONCURRENCY} rpc={PRO_RPC_CONCURRENCY} "
+            f"({wallet_tasks}+{rpc_tasks} tasks, {SIG_HARVESTERS} harvesters)"
+        )
+        return True, (
+            f"ANNIHILATE: wallet lane {PRO_WALLET_CONCURRENCY} + "
+            f"RPC lane {PRO_RPC_CONCURRENCY} (Pro tier max)"
+        )
+
     concurrency = max(1, min(MAX_CONCURRENCY, int(state["concurrency"])))
+    wallet_sem = None
+    rpc_sem = None
     inflight_sem = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(
         limit=concurrency + 10,
@@ -590,27 +724,26 @@ async def start_burner() -> Tuple[bool, str]:
     session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     state["session"] = session
 
-    weighted = build_weighted_pool(state["mode"])
-    mode = state["mode"]
+    weighted = build_weighted_pool(mode)
     worker_tasks = min(MAX_WORKER_TASKS, max(8, concurrency // 4))
 
-    tasks = []
     for i in range(worker_tasks):
-        t = asyncio.create_task(
+        tasks.append(asyncio.create_task(
             worker(i, session, state["keys"], weighted, state["stop_event"], mode)
-        )
-        tasks.append(t)
+        ))
 
     reporter = asyncio.create_task(stats_reporter(state["stop_event"], state["start_time"]))
     state["tasks"] = tasks
     state["reporter_task"] = reporter
 
-    if mode == "obliterate":
-        harvester = asyncio.create_task(
-            sig_harvester(session, state["keys"], state["stop_event"])
-        )
-        state["harvester_task"] = harvester
-        tasks.append(harvester)
+    if mode in ("obliterate", "annihilate"):
+        state["harvester_task"] = None
+        for i in range(SIG_HARVESTERS):
+            tasks.append(asyncio.create_task(
+                sig_harvester(session, state["keys"], state["stop_event"])
+            ))
+    else:
+        state["harvester_task"] = None
 
     state["recent_logs"].append(
         f"Burner started: {worker_tasks} tasks, {concurrency} in-flight, "
@@ -666,7 +799,7 @@ async def startup_event():
     if env_mode in OPERATION_POOLS:
         state["mode"] = env_mode
 
-    state["recent_logs"].append("Dashboard ready. OBLITERATE mode available.")
+    state["recent_logs"].append("Dashboard ready. ANNIHILATE mode for Professional tier.")
 
 
 @app.on_event("shutdown")
@@ -761,6 +894,19 @@ async def api_obliterate(keys_text: str = Form(default="")):
     return {"ok": ok, "message": message}
 
 
+@app.post("/api/annihilate")
+async def api_annihilate(keys_text: str = Form(default="")):
+    """Professional-tier dual-lane max burn: 100 wallet/s + 250 RPC/s lanes."""
+    await stop_burner()
+    if keys_text.strip():
+        parsed = parse_keys_text(keys_text)
+        if parsed:
+            state["keys"] = parsed
+    state["mode"] = "annihilate"
+    ok, message = await start_burner()
+    return {"ok": ok, "message": message}
+
+
 @app.post("/api/nuke")
 async def api_nuke(keys_text: str = Form(default="")):
     await stop_burner()
@@ -837,6 +983,7 @@ DASHBOARD_HTML = """
                     <div>
                         <label class="block text-xs font-medium text-zinc-400 mb-1.5">MODE</label>
                         <select id="mode" class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-sm">
+                            <option value="annihilate">⚡ ANNIHILATE (Pro dual-lane)</option>
                             <option value="obliterate">💀 OBLITERATE (100cr/call)</option>
                             <option value="nuke">☢️ NUKE (10cr/call)</option>
                             <option value="expensive">EXPENSIVE</option>
@@ -854,12 +1001,16 @@ DASHBOARD_HTML = """
                     <button onclick="stopBurn()" class="flex-1 py-3 font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-3xl">STOP</button>
                 </div>
 
-                <button onclick="obliterateMode()"
-                    class="w-full py-6 text-xl font-bold bg-gradient-to-r from-purple-900 via-red-700 to-red-600 hover:from-purple-800 hover:to-red-500 rounded-3xl shadow-xl shadow-red-950 flex items-center justify-center gap-3">
-                    <span class="text-3xl">💀</span>
-                    <span>OBLITERATE — MAX CREDIT BURN</span>
+                <button onclick="annihilateMode()"
+                    class="w-full py-6 text-xl font-bold bg-gradient-to-r from-yellow-700 via-red-600 to-purple-800 hover:from-yellow-600 hover:to-purple-700 rounded-3xl shadow-xl shadow-red-950 flex items-center justify-center gap-3">
+                    <span class="text-3xl">⚡</span>
+                    <span>ANNIHILATE — PRO TIER MAX</span>
                 </button>
-                <p class="text-[10px] text-center text-red-500/70 mt-1">200 concurrent + Wallet API + Enhanced TX + GTF (100 credits each)</p>
+                <p class="text-[10px] text-center text-red-500/70 mt-1">Dual-lane: 100 wallet/s + 250 RPC/s (100 credits each)</p>
+
+                <button onclick="obliterateMode()" class="mt-2 w-full py-3 text-sm font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-2xl">
+                    💀 OBLITERATE (Railway-safe)
+                </button>
 
                 <button onclick="nukeMode()" class="mt-2 w-full py-3 text-sm font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-2xl">
                     ☢️ Legacy NUKE (10cr endpoints)
@@ -951,7 +1102,8 @@ DASHBOARD_HTML = """
                     badge.classList.add('!border-red-600', 'bg-red-950');
                     dot.classList.add('bg-red-500');
                     dot.classList.remove('bg-zinc-500');
-                    text.textContent = data.mode === 'obliterate' ? 'OBLITERATING' : 'BURNING';
+                    text.textContent = data.mode === 'annihilate' ? 'ANNIHILATING'
+                        : data.mode === 'obliterate' ? 'OBLITERATING' : 'BURNING';
                     text.classList.add('text-red-400');
                 } else {
                     badge.classList.remove('!border-red-600', 'bg-red-950');
@@ -1007,12 +1159,20 @@ DASHBOARD_HTML = """
             setTimeout(refreshStats, 300);
         }
 
+        async function annihilateMode() {
+            const keys = document.getElementById('keys-text').value.trim();
+            if (!keys) { alert('Paste your Helius API key first.'); return; }
+            document.getElementById('mode').value = 'annihilate';
+            await fetch('/api/keys', { method: 'POST', body: keysForm() });
+            const res = await fetch('/api/annihilate', { method: 'POST', body: keysForm() });
+            const data = await res.json();
+            if (!data.ok) alert(data.message || 'Failed to start');
+            setTimeout(refreshStats, 400);
+        }
+
         async function obliterateMode() {
             const keys = document.getElementById('keys-text').value.trim();
-            if (!keys) {
-                alert('Paste your Helius API key first.');
-                return;
-            }
+            if (!keys) { alert('Paste your Helius API key first.'); return; }
             document.getElementById('concurrency').value = 200;
             document.getElementById('concurrency-slider').value = 200;
             document.getElementById('mode').value = 'obliterate';
