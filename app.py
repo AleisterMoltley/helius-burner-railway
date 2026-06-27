@@ -15,7 +15,7 @@ import os
 import random
 import time
 from collections import deque
-from typing import List, Dict, Any, Callable, Awaitable, Tuple
+from typing import List, Dict, Any, Callable, Awaitable, Tuple, Optional
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -26,7 +26,11 @@ import uvicorn
 
 HELIUS_RPC = "https://mainnet.helius-rpc.com"
 HELIUS_API = "https://api.helius.xyz"
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2000"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "500"))
+# Railway containers choke on hundreds of bare asyncio tasks — cap task count,
+# use a semaphore for actual in-flight HTTP concurrency instead.
+MAX_WORKER_TASKS = int(os.getenv("MAX_WORKER_TASKS", "48"))
+DEFAULT_OBLITERATE_CONCURRENCY = int(os.getenv("OBLITERATE_CONCURRENCY", "200"))
 
 KNOWN_PROGRAMS = [
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -66,6 +70,7 @@ FALLBACK_SIGNATURES = [
 ]
 
 sig_pool: deque = deque(maxlen=10000)
+inflight_sem: Optional[asyncio.Semaphore] = None
 
 state: Dict[str, Any] = {
     "keys": [],
@@ -320,13 +325,20 @@ async def do_wallet_batch_identity(session: aiohttp.ClientSession, key: str) -> 
 
 
 async def do_enhanced_transactions(session: aiohttp.ClientSession, key: str) -> BurnResult:
-    if len(sig_pool) >= 100:
-        sigs = [sig_pool.popleft() for _ in range(100)]
-    else:
-        sigs = list(FALLBACK_SIGNATURES)
-        while len(sigs) < 100:
-            sigs.extend(FALLBACK_SIGNATURES)
-        sigs = sigs[:100]
+    # Helius rejects duplicate signatures in a batch (HTTP 400).
+    if len(sig_pool) < 10:
+        return 503, "enhanced_transactions"
+
+    seen: set = set()
+    sigs: List[str] = []
+    while sig_pool and len(sigs) < 100:
+        sig = sig_pool.popleft()
+        if sig not in seen:
+            seen.add(sig)
+            sigs.append(sig)
+
+    if len(sigs) < 1:
+        return 503, "enhanced_transactions"
 
     url = f"{HELIUS_API}/v0/transactions?api-key={key}"
     payload = {"transactions": sigs}
@@ -409,6 +421,35 @@ def record_result(status: int, op_name: str) -> None:
             )
 
 
+async def execute_burn_op(
+    session: aiohttp.ClientSession,
+    keys: List[str],
+    weighted_ops: List[str],
+    key_index: int,
+) -> int:
+    """Run one burn operation under the global semaphore."""
+    global inflight_sem
+    op_name = random.choice(weighted_ops)
+    key = keys[key_index % len(keys)]
+
+    try:
+        async with inflight_sem:
+            func = OP_MAP[op_name]
+            status, op_name = await func(session, key)
+        record_result(status, op_name)
+        return status
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        state["stats"]["exceptions"] += 1
+        state["stats"]["total"] += 1
+        if state["stats"]["exceptions"] % 50 == 1:
+            state["recent_logs"].append(
+                f"[{time.strftime('%H:%M:%S')}] exception on {op_name}: {type(exc).__name__}"
+            )
+        return 0
+
+
 async def worker(
     worker_id: int,
     session: aiohttp.ClientSession,
@@ -429,26 +470,18 @@ async def worker(
             if stop_event.is_set():
                 break
 
-            op_name = random.choice(weighted_ops)
-            key = keys[key_index % len(keys)]
-            key_index += 1
-
             try:
-                func = OP_MAP[op_name]
-                status, op_name = await func(session, key)
-                record_result(status, op_name)
+                status = await execute_burn_op(session, keys, weighted_ops, key_index)
+                key_index += 1
                 if status == 429:
-                    backoff = min(0.05, backoff + 0.002)
+                    backoff = min(0.1, backoff + 0.005)
                 elif status == 200:
-                    backoff = max(0.0, backoff - 0.001)
+                    backoff = max(0.0, backoff - 0.002)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                stats = state["stats"]
-                stats["exceptions"] += 1
 
-        if mode not in AGGRESSIVE_MODES and random.random() < 0.05:
-            await asyncio.sleep(0.0005)
+        # Yield so FastAPI can still serve /api/stats while burning
+        await asyncio.sleep(0.002 if mode in AGGRESSIVE_MODES else 0.01)
 
 
 async def sig_harvester(
@@ -521,10 +554,13 @@ async def stats_reporter(stop_event: asyncio.Event, start_time: float):
             )
 
 
-async def start_burner():
-    if state["running"] or not state["keys"]:
-        return False
+async def start_burner() -> Tuple[bool, str]:
+    if state["running"]:
+        return False, "Already running — stop first"
+    if not state["keys"]:
+        return False, "No keys loaded — paste key and click Save Keys first"
 
+    global inflight_sem
     state["running"] = True
     state["start_time"] = time.time()
     state["stop_event"] = asyncio.Event()
@@ -542,17 +578,24 @@ async def start_burner():
     state["recent_logs"].clear()
     state["recent_logs"].append("=== BURN STARTED ===")
 
-    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=300)
-    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    concurrency = max(1, min(MAX_CONCURRENCY, int(state["concurrency"])))
+    inflight_sem = asyncio.Semaphore(concurrency)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency + 10,
+        limit_per_host=concurrency + 10,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    timeout = aiohttp.ClientTimeout(total=45, connect=8, sock_read=40)
     session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     state["session"] = session
 
     weighted = build_weighted_pool(state["mode"])
-    concurrency = max(1, int(state["concurrency"]))
     mode = state["mode"]
+    worker_tasks = min(MAX_WORKER_TASKS, max(8, concurrency // 4))
 
     tasks = []
-    for i in range(concurrency):
+    for i in range(worker_tasks):
         t = asyncio.create_task(
             worker(i, session, state["keys"], weighted, state["stop_event"], mode)
         )
@@ -570,10 +613,10 @@ async def start_burner():
         tasks.append(harvester)
 
     state["recent_logs"].append(
-        f"Burner started: {concurrency} workers, mode={mode}, "
-        f"keys={len(state['keys'])}"
+        f"Burner started: {worker_tasks} tasks, {concurrency} in-flight, "
+        f"mode={mode}, keys={len(state['keys'])}"
     )
-    return True
+    return True, f"Started ({concurrency} concurrent, {worker_tasks} tasks)"
 
 
 async def stop_burner():
@@ -651,24 +694,7 @@ async def get_stats():
 
 @app.post("/api/keys")
 async def set_keys(keys_text: str = Form(...)):
-    raw_lines = [k.strip() for k in keys_text.strip().splitlines() if k.strip()]
-    new_keys = []
-    for line in raw_lines:
-        key = None
-        if "api-key=" in line:
-            try:
-                after = line.split("api-key=")[1]
-                key = after.split("&")[0].split(" ")[0].strip()
-            except Exception:
-                pass
-        else:
-            key = line.strip()
-
-        if key and len(key) > 10:
-            new_keys.append(key)
-
-    seen = set()
-    new_keys = [k for k in new_keys if not (k in seen or seen.add(k))]
+    new_keys = parse_keys_text(keys_text)
     state["keys"] = new_keys
     state["recent_logs"].append(f"Updated keys ({len(new_keys)} total)")
     return {"ok": True, "count": len(new_keys)}
@@ -685,10 +711,34 @@ async def set_config(concurrency: int = Form(...), mode: str = Form(...)):
     return {"ok": True}
 
 
+def parse_keys_text(keys_text: str) -> List[str]:
+    new_keys = []
+    for line in keys_text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        key = None
+        if "api-key=" in line:
+            try:
+                key = line.split("api-key=")[1].split("&")[0].split(" ")[0].strip()
+            except Exception:
+                pass
+        else:
+            key = line
+        if key and len(key) > 10:
+            new_keys.append(key)
+    seen = set()
+    return [k for k in new_keys if not (k in seen or seen.add(k))]
+
+
 @app.post("/api/start")
-async def api_start():
-    success = await start_burner()
-    return {"ok": success, "message": "Burner started" if success else "Already running or no keys"}
+async def api_start(keys_text: str = Form(default="")):
+    if keys_text.strip():
+        parsed = parse_keys_text(keys_text)
+        if parsed:
+            state["keys"] = parsed
+    ok, message = await start_burner()
+    return {"ok": ok, "message": message}
 
 
 @app.post("/api/stop")
@@ -698,25 +748,30 @@ async def api_stop():
 
 
 @app.post("/api/obliterate")
-async def api_obliterate():
+async def api_obliterate(keys_text: str = Form(default="")):
     """One-click max destruction: obliterate mode + high concurrency."""
     await stop_burner()
+    if keys_text.strip():
+        parsed = parse_keys_text(keys_text)
+        if parsed:
+            state["keys"] = parsed
     state["mode"] = "obliterate"
-    state["concurrency"] = int(os.getenv("OBLITERATE_CONCURRENCY", "800"))
-    success = await start_burner()
-    return {
-        "ok": success,
-        "message": f"OBLITERATE started ({state['concurrency']} workers)" if success else "Failed",
-    }
+    state["concurrency"] = DEFAULT_OBLITERATE_CONCURRENCY
+    ok, message = await start_burner()
+    return {"ok": ok, "message": message}
 
 
 @app.post("/api/nuke")
-async def api_nuke():
+async def api_nuke(keys_text: str = Form(default="")):
     await stop_burner()
+    if keys_text.strip():
+        parsed = parse_keys_text(keys_text)
+        if parsed:
+            state["keys"] = parsed
     state["mode"] = "nuke"
-    state["concurrency"] = 400
-    success = await start_burner()
-    return {"ok": success, "message": "NUKE started" if success else "Failed"}
+    state["concurrency"] = 200
+    ok, message = await start_burner()
+    return {"ok": ok, "message": message}
 
 
 # ==================== DASHBOARD UI ====================
@@ -773,9 +828,9 @@ DASHBOARD_HTML = """
                 <div class="grid grid-cols-2 gap-4 mb-6">
                     <div>
                         <label class="block text-xs font-medium text-zinc-400 mb-1.5">CONCURRENCY</label>
-                        <input type="number" id="concurrency" value="800"
+                        <input type="number" id="concurrency" value="200"
                             class="w-full bg-zinc-950 border border-zinc-800 rounded-2xl p-3 text-lg font-semibold">
-                        <input type="range" id="concurrency-slider" min="50" max="2000" step="50" value="800"
+                        <input type="range" id="concurrency-slider" min="50" max="500" step="25" value="200"
                             class="w-full accent-red-600 mt-1"
                             oninput="document.getElementById('concurrency').value=this.value">
                     </div>
@@ -804,7 +859,7 @@ DASHBOARD_HTML = """
                     <span class="text-3xl">💀</span>
                     <span>OBLITERATE — MAX CREDIT BURN</span>
                 </button>
-                <p class="text-[10px] text-center text-red-500/70 mt-1">800 workers + Wallet API + Enhanced TX + GTF (100 credits each)</p>
+                <p class="text-[10px] text-center text-red-500/70 mt-1">200 concurrent + Wallet API + Enhanced TX + GTF (100 credits each)</p>
 
                 <button onclick="nukeMode()" class="mt-2 w-full py-3 text-sm font-semibold bg-zinc-800 hover:bg-zinc-700 rounded-2xl">
                     ☢️ Legacy NUKE (10cr endpoints)
@@ -933,10 +988,17 @@ DASHBOARD_HTML = """
             await refreshStats();
         }
 
+        function keysForm() {
+            const form = new FormData();
+            const keys = document.getElementById('keys-text').value.trim();
+            if (keys) form.append('keys_text', keys);
+            return form;
+        }
+
         async function startBurn() {
-            const res = await fetch('/api/start', { method: 'POST' });
+            const res = await fetch('/api/start', { method: 'POST', body: keysForm() });
             const data = await res.json();
-            if (!data.ok) alert(data.message || 'Failed');
+            if (!data.ok) alert(data.message || 'Failed to start');
             setTimeout(refreshStats, 300);
         }
 
@@ -946,19 +1008,28 @@ DASHBOARD_HTML = """
         }
 
         async function obliterateMode() {
-            document.getElementById('concurrency').value = 800;
-            document.getElementById('concurrency-slider').value = 800;
+            const keys = document.getElementById('keys-text').value.trim();
+            if (!keys) {
+                alert('Paste your Helius API key first.');
+                return;
+            }
+            document.getElementById('concurrency').value = 200;
+            document.getElementById('concurrency-slider').value = 200;
             document.getElementById('mode').value = 'obliterate';
-            const res = await fetch('/api/obliterate', { method: 'POST' });
+            await fetch('/api/keys', { method: 'POST', body: keysForm() });
+            const res = await fetch('/api/obliterate', { method: 'POST', body: keysForm() });
             const data = await res.json();
-            if (!data.ok) alert(data.message || 'Failed');
+            if (!data.ok) alert(data.message || 'Failed to start');
             setTimeout(refreshStats, 400);
         }
 
         async function nukeMode() {
-            const res = await fetch('/api/nuke', { method: 'POST' });
+            const keys = document.getElementById('keys-text').value.trim();
+            if (!keys) { alert('Paste your Helius API key first.'); return; }
+            await fetch('/api/keys', { method: 'POST', body: keysForm() });
+            const res = await fetch('/api/nuke', { method: 'POST', body: keysForm() });
             const data = await res.json();
-            if (!data.ok) alert(data.message || 'Failed');
+            if (!data.ok) alert(data.message || 'Failed to start');
             setTimeout(refreshStats, 400);
         }
 
@@ -966,7 +1037,7 @@ DASHBOARD_HTML = """
             const res = await fetch('/api/stats');
             const data = await res.json();
             document.getElementById('concurrency').value = data.concurrency;
-            document.getElementById('concurrency-slider').value = Math.min(2000, data.concurrency);
+            document.getElementById('concurrency-slider').value = Math.min(500, data.concurrency);
             document.getElementById('mode').value = data.mode;
             await refreshStats();
             if (pollInterval) clearInterval(pollInterval);
