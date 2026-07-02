@@ -58,6 +58,41 @@ You can change config while it's running (it will use new values on next start).
 
 ---
 
+## Solana RPC Proxy (`/api/solana-rpc`)
+
+Same idea as rush.trading: your Railway app can expose a JSON-RPC proxy so clients never see the Helius key.
+
+**Railway Variables:**
+
+| Variable | Required | Description |
+|---|---|---|
+| `HELIUS_KEY` | yes | Your Helius API key (or use `HELIUS_KEYS` — first key is used for RPC) |
+| `RPC_PROXY_SECRET` | recommended | If set, require `Authorization: Bearer <secret>` or header `X-RPC-Key: <secret>` |
+| `RPC_RATE_LIMIT_PER_MIN` | optional | Default `120` requests/min per IP |
+| `RPC_PROXY_ENABLED` | optional | Default `1`; set `0` to disable proxy only |
+| `RPC_ALLOW_METHODS` | optional | Comma list, or `*` for all (except blocked `getProgramAccounts`) |
+
+**Example:**
+
+```bash
+curl -X POST "https://YOUR-APP.up.railway.app/api/solana-rpc" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_RPC_PROXY_SECRET" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+```
+
+**In a Solana app** (e.g. `@solana/web3.js`):
+
+```js
+const connection = new Connection("https://YOUR-APP.up.railway.app/api/solana-rpc", {
+  httpHeaders: { Authorization: "Bearer YOUR_RPC_PROXY_SECRET" },
+});
+```
+
+Health check for Railway: `GET /health`
+
+---
+
 ## Railway Tips for Maximum Burn
 
 - Use a paid plan if you want high sustained RPS (free tier will throttle hard).

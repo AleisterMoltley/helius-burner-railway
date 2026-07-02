@@ -22,6 +22,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
+from rpc_proxy import handle_solana_rpc, proxy_enabled, helius_key
+
 # ==================== CONFIG & STATE ====================
 
 HELIUS_RPC = "https://mainnet.helius-rpc.com"
@@ -800,11 +802,30 @@ async def startup_event():
         state["mode"] = env_mode
 
     state["recent_logs"].append("Dashboard ready. ANNIHILATE mode for Professional tier.")
+    if proxy_enabled():
+        state["recent_logs"].append("RPC proxy: POST /api/solana-rpc (Helius key server-side).")
+    else:
+        state["recent_logs"].append("RPC proxy off — set HELIUS_KEY to enable /api/solana-rpc.")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await stop_burner()
+
+
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "rpc_proxy": proxy_enabled(),
+        "helius_configured": helius_key() is not None,
+        "burner_running": state["running"],
+    }
+
+
+@app.post("/api/solana-rpc")
+async def solana_rpc(request: Request):
+    return await handle_solana_rpc(request)
 
 
 @app.get("/api/stats")
